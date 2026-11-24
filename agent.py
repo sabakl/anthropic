@@ -38,13 +38,7 @@ def cause_in_plain_words(cause_code: str, language: str = "en") -> Dict[str, Any
 
 # ── Shared helpers for the tools below ───────────────────────────────────────
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _HANDBOOK: Dict[str, Dict[str, str]] = {}
-
-
-def _now() -> datetime:
-    """The one 'now' of the sample data: fixture_clock in bookings.json."""
-    return datetime.fromisoformat(backend.load_bookings()["fixture_clock"])
 
 
 def _handbook_sections() -> Dict[str, Dict[str, str]]:
@@ -64,30 +58,6 @@ def _flight_row(flight_no: str, date: str):
 
 
 # ── The tools ────────────────────────────────────────────────────────────────
-def reopen_stats(intent_label: str = "", cause_code: str = "") -> Dict[str, Any]:
-    """How often each kind of problem came back within 72 hours, from the sample transcripts."""
-    path = backend.DATA_DIR / "transcripts_sample.jsonl"
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    matched = [r for r in rows
-               if (not intent_label or r.get("intent_label") == intent_label)
-               and (not cause_code or (r.get("disruption") or {}).get("cause_code") == cause_code.upper())]
-    if not matched:
-        labels = sorted({r.get("intent_label") for r in rows})
-        return {"error": "No conversation matches that filter.", "intent_labels_available": labels,
-                "cause_codes_available": sorted({(r.get("disruption") or {}).get("cause_code") for r in rows})}
-    reopened = [r for r in matched if r.get("reopened_within_72h")]
-    return {
-        "sample_note": f"Based on only {len(rows)} conversations handled by people. Say 'in the "
-                       "sample', never give it as a rate or a prediction.",
-        "conversations_matched": len(matched),
-        "reopened_within_72h": len(reopened),
-        "conversations": [{"id": r["id"], "intent_label": r["intent_label"],
-                           "cause_code": (r.get("disruption") or {}).get("cause_code"),
-                           "reopened_within_72h": bool(r.get("reopened_within_72h")),
-                           "reopen_reason": r.get("reopen_reason", "")} for r in matched],
-    }
-
-
 def care_entitlements(pnr: str, cause_code: str, delay_minutes: int, status: str,
                       wait_minutes_for_alternative: int = None) -> Dict[str, Any]:
     """Meal / hotel / ground care for this booking, with the Handbook's care section."""
@@ -98,35 +68,6 @@ def care_entitlements(pnr: str, cause_code: str, delay_minutes: int, status: str
         return policy
     return {"policy_row_id": policy["policy_row_id"], "care": policy["care"],
             "handbook_section_6": _handbook_sections()["6"]["text"]}
-
-
-def departures_in_window(airport: str, date: str, from_time: str = "00:00",
-                         to_time: str = "23:59") -> Dict[str, Any]:
-    """Flights still leaving an airport in a time window, by estimated departure."""
-    ap = (airport or "").strip().upper()
-    if len(ap) != 3:
-        return {"error": f"airport must be a three-letter code like DEN, got {airport!r}."}
-    if not _ISO_DATE.match(date or ""):
-        return {"error": f"date must be YYYY-MM-DD, got {date!r}."}
-    if not (_HHMM.match(from_time or "") and _HHMM.match(to_time or "")):
-        return {"error": "from_time and to_time must be 24-hour HH:MM, e.g. 12:00 and 18:00."}
-    leaving, cancelled = [], 0
-    for r in backend.load_flights():
-        if r["origin"] != ap or r["date"] != date:
-            continue
-        est = backend._add_minutes(r["sched_dep_local"], r["delay_min"])
-        if not (from_time <= est <= to_time):
-            continue
-        if r["status"] == "CANCELLED":
-            cancelled += 1
-            continue
-        leaving.append({"flight_no": r["flight_no"], "dest": r["dest"], "status": r["status"],
-                        "sched_dep_local": r["sched_dep_local"], "est_dep_local": est,
-                        "delay_min": r["delay_min"], "seats_left_Y": r["seats_left_Y"],
-                        "seats_left_J": r["seats_left_J"], "remarks": r["remarks"]})
-    leaving.sort(key=lambda f: f["est_dep_local"])
-    return {"airport": ap, "date": date, "window": f"{from_time}-{to_time}",
-            "as_of": _now().isoformat(), "cancelled_in_window": cancelled, "departures": leaving}
 
 
 def seats_left(flight_no: str, date: str, party_size: int = None) -> Dict[str, Any]:
@@ -144,45 +85,6 @@ def seats_left(flight_no: str, date: str, party_size: int = None) -> Dict[str, A
         out["fits_in_Y"] = r["seats_left_Y"] >= party_size
         out["fits_in_J"] = r["seats_left_J"] >= party_size
     return out
-
-
-def ground_stop_status(airport: str) -> Dict[str, Any]:
-    """Whether an airport is under a ground stop right now, and until when, from flight remarks."""
-    ap = (airport or "").strip().upper()
-    if len(ap) != 3:
-        return {"error": f"airport must be a three-letter code like DEN, got {airport!r}."}
-    now = _now()
-    now_hhmm = now.strftime("%H:%M")
-    evidence, windows = [], []
-    for r in backend.load_flights():
-        rem = r["remarks"] or ""
-        if r["date"] == now.strftime("%Y-%m-%d") and re.search(rf"\b{ap}\b.*(ground stop|GDP)", rem, re.I):
-            evidence.append({"flight_no": r["flight_no"], "remarks": rem})
-            windows += re.findall(r"(\d\d:\d\d)-(\d\d:\d\d)", rem)
-    base = {"airport": ap, "as_of": now.isoformat(), "evidence": evidence}
-    if not evidence:
-        return {**base, "ground_stop": False, "note": f"No ground stop for {ap} in the flight remarks."}
-    if not windows:
-        return {**base, "ground_stop": True, "until_local": None,
-                "note": "A ground stop is mentioned but no end time is in the data. Say you do not know when it ends."}
-    start, end = min(w[0] for w in windows), max(w[1] for w in windows)
-    return {**base, "ground_stop": start <= now_hhmm <= end, "window_local": f"{start}-{end}",
-            "until_local": end, "now_local": now_hhmm,
-            "note": "Times are local (MDT). The end time is the data's, not a promise it will lift then."}
-
-
-def hold_time_left(hold_id: str) -> Dict[str, Any]:
-    """Minutes left on a seat hold, against the sample data's 'now'."""
-    hid = (hold_id or "").strip().upper()
-    hold = backend._holds.get(hid)
-    if hold is None:
-        if hid in backend._confirmed:
-            return {"hold_id": hid, "status": "already_confirmed"}
-        return {"error": f"No active hold {hold_id!r}. Holds come from hold_seat in this conversation."}
-    now = _now()
-    left = (hold["expires_at"] - now).total_seconds() / 60
-    return {"hold_id": hid, "option_id": hold["option_id"], "expires_at": hold["expires_at"].isoformat(),
-            "as_of": now.isoformat(), "minutes_left": max(0, round(left, 1)), "expired": left <= 0}
 
 
 def what_automation_will_not_do() -> Dict[str, Any]:
@@ -215,24 +117,6 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for 
         },
     },
     {
-        "name": "reopen_stats",
-        "description": (
-            "Answer 'is this problem going to come back?' from eight real conversations "
-            "handled by people: how many of a kind of problem were reopened within 72 hours, "
-            "and why. It is a tiny sample, so say 'in the sample', never a rate or a promise. "
-            "Filter by intent_label (e.g. rebook_after_cancellation, refund_vs_credit) or "
-            "cause_code; with no filter it covers all eight. An unmatched filter lists the valid ones."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "intent_label": {"type": "string", "description": "Kind of problem, e.g. rebook_after_cancellation. Optional."},
-                "cause_code": {"type": "string", "enum": ["WX", "ATC", "MX", "CREW", "SEC"], "description": "Disruption cause. Optional."},
-            },
-            "required": [],
-        },
-    },
-    {
         "name": "care_entitlements",
         "description": (
             "Answer 'do I get a meal or a hotel while I wait?' for this booking: the meal, "
@@ -255,25 +139,6 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for 
         },
     },
     {
-        "name": "departures_in_window",
-        "description": (
-            "List what is still leaving an airport in a time window, by estimated departure "
-            "(cancelled flights are counted, not listed), with status and seats left. Use for "
-            "'what is still leaving Denver this afternoon?'. For the customer's own booking "
-            "use search_alternatives. Dates run 2025-05-07 to 2025-05-09."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "airport": {"type": "string", "description": "Departure airport code, e.g. DEN"},
-                "date": {"type": "string", "description": "Local date, ISO format YYYY-MM-DD, e.g. 2025-05-08"},
-                "from_time": {"type": "string", "description": "Window start, 24-hour HH:MM local. Defaults to 00:00. 'Afternoon' is 12:00 to 18:00."},
-                "to_time": {"type": "string", "description": "Window end, 24-hour HH:MM local. Defaults to 23:59."},
-            },
-            "required": ["airport", "date"],
-        },
-    },
-    {
         "name": "seats_left",
         "description": (
             "Check whether one named flight has room: free seats in economy (Y) and business "
@@ -292,33 +157,6 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for 
         },
     },
     {
-        "name": "ground_stop_status",
-        "description": (
-            "Say whether an airport is under an air-traffic ground stop right now, and until "
-            "when, from flight remarks and the current time. Use for 'is Denver still stopped, "
-            "and until when?'. If it gives no end time, say you do not know; never promise "
-            "when a stop lifts."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {"airport": {"type": "string", "description": "Airport code, e.g. DEN"}},
-            "required": ["airport"],
-        },
-    },
-    {
-        "name": "hold_time_left",
-        "description": (
-            "Tell the customer how long they have before a held seat is released. Pass the "
-            "hold_id that hold_seat returned. Use for 'how long do I have?'. It reads; it "
-            "never extends or confirms a hold."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {"hold_id": {"type": "string", "description": "hold_id returned by hold_seat, e.g. HOLD-AB12CD"}},
-            "required": ["hold_id"],
-        },
-    },
-    {
         "name": "what_automation_will_not_do",
         "description": (
             "Return Handbook section 7, the list of things this chat is not allowed to do "
@@ -333,12 +171,8 @@ EXTRA_TOOLS: List[Dict[str, Any]] = [   # ✏️ Build 2, step 2.1: schemas for 
 # next_available_day and fare_rules are served by the MCP server (step 2.2): one owner each.
 LOCAL_TOOLS: Dict[str, Any] = {          # ✏️ Build 2, step 2.1: the functions behind them
     "cause_in_plain_words": cause_in_plain_words,
-    "reopen_stats": reopen_stats,
     "care_entitlements": care_entitlements,
-    "departures_in_window": departures_in_window,
     "seats_left": seats_left,
-    "ground_stop_status": ground_stop_status,
-    "hold_time_left": hold_time_left,
     "what_automation_will_not_do": what_automation_will_not_do,
 }
 

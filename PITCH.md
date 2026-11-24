@@ -8,7 +8,7 @@ Number: 5 of 5 ticket types resolved with tools at gate 1.4; the tool list now c
 Safety check: We ran the group booking (G2HL9V) on the wire: it escalated to the Group Desk (ESC-BDE7FD) and held, rebooked and issued nothing.
 Next: Prove the 8 tools no probe has chosen yet by asking each its own question, and cut the overlapping ones before the per-turn cost grows.
 Still broken: The abusive-message ticket (R8KD3F) still gets a calm, normal reply with no tone gate, and next_available_day answers for a party of one only.
-Lever: <cost | speed | intelligence>
+Lever: cost
 
 ## Priya asked
 
